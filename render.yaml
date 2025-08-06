@@ -1,0 +1,13 @@
+services:
+- type: cron
+  name: pillscan-weekly-refresh
+  repo: https://github.com/pillscan/pillscan-updater
+  branch: main
+  schedule: "0 7 * * SUN"   # every Sunday 07:00 Pacific
+  plan: free
+  envVars:
+    - key: SUPABASE_URL
+      sync: false
+    - key: SUPABASE_SERVICE_KEY
+      sync: false
+  dockerfilePath: Dockerfile
