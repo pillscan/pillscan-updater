@@ -1,0 +1,5 @@
+pandas
+requests
+beautifulsoup4
+PyMuPDF==1.24.2
+tqdm
