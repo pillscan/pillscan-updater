@@ -1,5 +1,4 @@
+supabase==2.6.0
 pandas
-requests
-beautifulsoup4
-PyMuPDF==1.24.2
+httpx
 tqdm
