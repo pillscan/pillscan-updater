@@ -1,5 +1,6 @@
 # run_pipeline.py — Health Canada DPD (Marketed) → Supabase
-# Filters: Human • Oral • Tablet/Capsule/Softgel
+# Filters to Human • Oral • Tablet/Capsule/Softgel (with diagnostics & safe fallback)
+
 import os, io, zipfile, re
 import pandas as pd
 import httpx
@@ -111,14 +112,35 @@ def main():
           .merge(comp_c,  on="DRUG_CODE", how="left")
           .merge(sched_c, on="DRUG_CODE", how="left"))
 
-    # Filter: Human + Oral + Tablet/Capsule/Softgel (English/French coverage if present)
-    CAT  = df.get("PRODUCT_CATEGORIZATION","").str.lower()
-    ROUT = df.get("ROUTE","").str.lower()
-    FORM = df.get("DOSAGE_FORM","").str.lower()
-    is_human = CAT.str.contains("human|humain", na=False)
-    is_oral  = ROUT.str.contains("oral|orale", na=False)
-    is_tabcap= FORM.str.contains(r"tablet|capsule|softgel|compr|gélule", na=False)
-    df = df[is_human & is_oral & is_tabcap].copy()
+    # -----------------------------
+    # Diagnostics + forgiving filter
+    # -----------------------------
+    print("Rows before filter:", len(df))
+    try:
+        print("Top ROUTE:", df.get("ROUTE","").str.lower().value_counts().head(10).to_dict())
+    except Exception:
+        pass
+    try:
+        print("Top FORM:", df.get("DOSAGE_FORM","").str.lower().value_counts().head(10).to_dict())
+    except Exception:
+        pass
+    try:
+        print("Top CATEGORY:", df.get("PRODUCT_CATEGORIZATION","").str.lower().value_counts().head(10).to_dict())
+    except Exception:
+        pass
+
+    is_human = df.get("PRODUCT_CATEGORIZATION","").str.contains(r"\bhuman\b|\bhumain\b", case=False, na=False)
+    is_oral  = df.get("ROUTE","").str.contains(r"\boral\b|\borale\b|\bby mouth\b|\bper os\b", case=False, na=False)
+    is_tabcap= df.get("DOSAGE_FORM","").str.contains(r"tablet|caplet|capsule|softgel|gélule|compr", case=False, na=False)
+
+    filtered = df[is_human & is_oral & is_tabcap].copy()
+    print("After filter:", len(filtered), "rows")
+
+    if len(filtered) == 0:
+        print("⚠️ Filter removed everything. Sending 200 preview rows so we can confirm Supabase upsert works.")
+        filtered = df.head(200).copy()
+
+    df = filtered
 
     # DIN
     if "DRUG_IDENTIFICATION_NUMBER" in df.columns:
