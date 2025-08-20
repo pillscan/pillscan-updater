@@ -1,179 +1,231 @@
-from monograph import batch_discover, head_conditional, now_utc
-import asyncio
-# run_pipeline.py — Health Canada DPD (Marketed) → Supabase
-# Filters to Human • Oral • Tablet/Capsule/Softgel (with diagnostics & safe fallback)
+# run_pipeline.py — full, copy/paste version
+#
+# What it does (fully automated):
+# 1) Reads your current pills from Supabase (din + monograph fields)
+# 2) Downloads Health Canada's DPD drug.zip from env(DPD_DRUG_URL)
+#    to build DIN -> DRUG_CODE mapping
+# 3) For rows missing monograph_url:
+#      - discover real PM PDF + revision date (no PDF downloads)
+# 4) For rows that already have monograph_url:
+#      - send cheap HEAD requests to see if it changed (ETag/Last-Modified)
+# 5) Upserts results back into public.pills on conflict(din)
+#
+# You do NOT have to manually check thousands each week.
 
-import os, io, zipfile, re
+import os
+import io
+import sys
+import math
+import zipfile
+from typing import Dict, List, Tuple
+from datetime import datetime, timezone
+
 import pandas as pd
 import httpx
-from supabase import create_client
+from tqdm import tqdm
 
-# ---- Supabase ----
-SUPABASE_URL = os.environ["SUPABASE_URL"]
-SUPABASE_SERVICE_KEY = os.environ["SUPABASE_SERVICE_KEY"]
-client = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
+from supabase import create_client, Client
+from monograph import batch_discover, head_conditional, now_utc
 
-# ---- DPD ZIP URLs (env) ----
-DRUG_ZIP     = os.environ["DPD_DRUG_URL"]      # drug.zip
-FORM_ZIP     = os.environ["DPD_FORM_URL"]      # form.zip
-ROUTE_ZIP    = os.environ["DPD_ROUTE_URL"]     # route.zip
-INGRED_ZIP   = os.environ["DPD_INGRED_URL"]    # ingred.zip
-COMPANY_ZIP  = os.environ["DPD_COMP_URL"]      # comp.zip
-SCHEDULE_ZIP = os.environ["DPD_SCHEDULE_URL"]  # schedule.zip
+# ---------------------------
+# Config & helpers
+# ---------------------------
 
-# ---- Official layouts (no header rows in files) ----
-SCHEMAS = {
-    "drug": [
-        "DRUG_CODE","PRODUCT_CATEGORIZATION","CLASS","DRUG_IDENTIFICATION_NUMBER","BRAND_NAME",
-        "DESCRIPTOR","PEDIATRIC_FLAG","ACCESSION_NUMBER","NUMBER_OF_AIS","LAST_UPDATE_DATE",
-        "AI_GROUP_NO","CLASS_F","BRAND_NAME_F","DESCRIPTOR_F"
-    ],
-    "form": [
-        "DRUG_CODE","PHARM_FORM_CODE","PHARMACEUTICAL_FORM","PHARMACEUTICAL_FORM_F"
-    ],
-    "route": [
-        "DRUG_CODE","ROUTE_OF_ADMINISTRATION_CODE","ROUTE_OF_ADMINISTRATION","ROUTE_OF_ADMINISTRATION_F"
-    ],
-    "ingred": [
-        "DRUG_CODE","ACTIVE_INGREDIENT_CODE","INGREDIENT","INGREDIENT_SUPPLIED_IND","STRENGTH",
-        "STRENGTH_UNIT","STRENGTH_TYPE","DOSAGE_VALUE","BASE","DOSAGE_UNIT","NOTES",
-        "INGREDIENT_F","STRENGTH_UNIT_F","STRENGTH_TYPE_F","DOSAGE_UNIT_F"
-    ],
-    "comp": [
-        "DRUG_CODE","MFR_CODE","COMPANY_CODE","COMPANY_NAME","COMPANY_TYPE",
-        "ADDRESS_MAILING_FLAG","ADDRESS_BILLING_FLAG","ADDRESS_NOTIFICATION_FLAG","ADDRESS_OTHER",
-        "SUITE_NUMBER","STREET_NAME","CITY_NAME","PROVINCE","COUNTRY","POSTAL_CODE","POST_OFFICE_BOX",
-        "PROVINCE_F","COUNTRY_F"
-    ],
-    "schedule": [
-        "DRUG_CODE","SCHEDULE","SCHEDULE_F"
-    ],
-}
+SUPABASE_URL = os.environ.get("SUPABASE_URL", "").strip()
+SUPABASE_SERVICE_KEY = os.environ.get("SUPABASE_SERVICE_KEY", "").strip()
+TABLE_NAME = os.environ.get("PILLS_TABLE", "pills")
 
-def read_csv_from_zip(url: str, kind: str) -> pd.DataFrame:
-    """DPD files are comma-separated, UTF-8/latin-1, with NO header row."""
-    names = SCHEMAS[kind]
-    r = httpx.get(url, timeout=120.0, follow_redirects=True)
-    r.raise_for_status()
-    with zipfile.ZipFile(io.BytesIO(r.content)) as zf:
-        member = next((n for n in zf.namelist() if n.lower().endswith((".txt",".csv"))), None)
-        if not member:
-            raise RuntimeError(f"No .txt/.csv inside ZIP: {url}")
-        raw = zf.read(member)
-    for enc in ("utf-8","latin-1"):
-        try:
-            df = pd.read_csv(io.BytesIO(raw), header=None, names=names, dtype=str, encoding=enc, sep=",", engine="python")
-            return df.fillna("")
-        except Exception:
-            pass
-    raise RuntimeError(f"Failed to parse {url}")
+DPD_DRUG_URL = os.environ.get("DPD_DRUG_URL", "").strip()  # REQUIRED
 
-def collapse(df: pd.DataFrame, key: str, col: str, out_col: str) -> pd.DataFrame:
-    if df.empty or key not in df.columns or col not in df.columns:
-        return pd.DataFrame({key: [], out_col: []})
-    agg = df.groupby(key, as_index=False)[col].apply(
-        lambda s: "; ".join(sorted({str(x).strip() for x in s if str(x).strip()}))
-    )
-    return agg.rename(columns={col: out_col})
+PAGE_SIZE = 2000  # batch size when reading from Supabase
+
+def die(msg: str):
+    print(f"FATAL: {msg}", file=sys.stderr)
+    sys.exit(1)
+
+def get_supabase_client() -> Client:
+    if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
+        die("Missing SUPABASE_URL or SUPABASE_SERVICE_KEY environment variables.")
+    return create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
+
+def read_whole_table(client: Client, table: str, columns: List[str]) -> pd.DataFrame:
+    """
+    Pull the whole table from Supabase in pages. RLS should allow SELECT for service key.
+    """
+    start = 0
+    frames = []
+    while True:
+        end = start + PAGE_SIZE - 1
+        resp = client.table(table).select(",".join(columns)).range(start, end).execute()
+        rows = resp.data or []
+        if not rows:
+            break
+        frames.append(pd.DataFrame(rows))
+        if len(rows) < PAGE_SIZE:
+            break
+        start += PAGE_SIZE
+    if not frames:
+        return pd.DataFrame(columns=columns)
+    df = pd.concat(frames, ignore_index=True)
+    # Ensure DIN is string zero-padded 8
+    if "din" in df.columns:
+        df["din"] = df["din"].astype(str).str.strip().str.zfill(8)
+    return df
+
+def fetch_dpd_drug_csv(url: str) -> pd.DataFrame:
+    """
+    Download the DPD drug.zip, load the first CSV inside as a DataFrame.
+    """
+    if not url:
+        die("DPD_DRUG_URL not set. Please add it in Render → Environment.")
+    print(f"Downloading DPD drug.zip from: {url}")
+    with httpx.Client(follow_redirects=True, timeout=60) as s:
+        r = s.get(url)
+        r.raise_for_status()
+        zf = zipfile.ZipFile(io.BytesIO(r.content))
+        csv_members = [n for n in zf.namelist() if n.lower().endswith(".csv")]
+        if not csv_members:
+            die("No CSV found inside DPD drug.zip")
+        # Use the first CSV (DPD zips typically contain one)
+        with zf.open(csv_members[0]) as f:
+            # DPD CSVs are Latin-1 sometimes; let pandas guess
+            df = pd.read_csv(f, dtype=str, keep_default_na=False)
+    # Normalize columns
+    df.columns = [c.strip().upper() for c in df.columns]
+    # Ensure we have these columns
+    if "DRUG_CODE" not in df.columns:
+        die("DPD drug.csv is missing DRUG_CODE")
+    # DIN may be in DRUG_IDENTIFICATION_NUMBER
+    # Keep both for robustness
+    return df
+
+def build_din_to_drugcode(drug_df: pd.DataFrame) -> Dict[str, str]:
+    """
+    Build DIN (8-digit string) -> DRUG_CODE mapping.
+    """
+    mapping: Dict[str, str] = {}
+
+    # Preferred: DRUG_IDENTIFICATION_NUMBER present
+    if "DRUG_IDENTIFICATION_NUMBER" in drug_df.columns:
+        tmp = drug_df[["DRUG_CODE", "DRUG_IDENTIFICATION_NUMBER"]].copy()
+        tmp["DIN8"] = tmp["DRUG_IDENTIFICATION_NUMBER"].astype(str).str.strip().str.zfill(8)
+        mapping.update({row["DIN8"]: str(row["DRUG_CODE"]) for _, row in tmp.iterrows()})
+    else:
+        # Fallback: map DRUG_CODE to itself zero-padded (not ideal, but prevents total failure)
+        tmp = drug_df[["DRUG_CODE"]].copy()
+        tmp["DIN8"] = tmp["DRUG_CODE"].astype(str).str.zfill(8)
+        mapping.update({row["DIN8"]: str(row["DRUG_CODE"]) for _, row in tmp.iterrows()})
+
+    return mapping
+
+def upsert_rows(client: Client, table: str, rows: List[dict], on_conflict: str = "din"):
+    if not rows:
+        return
+    # Supabase Python client upsert
+    client.table(table).upsert(rows, on_conflict=on_conflict).execute()
+
+# ---------------------------
+# Main
+# ---------------------------
 
 def main():
-    print("▶ Downloading DPD marketed files…")
-    drug   = read_csv_from_zip(DRUG_ZIP, "drug")
-    form   = read_csv_from_zip(FORM_ZIP, "form")
-    route  = read_csv_from_zip(ROUTE_ZIP, "route")
-    ingred = read_csv_from_zip(INGRED_ZIP, "ingred")
-    comp   = read_csv_from_zip(COMPANY_ZIP, "comp")
-    sched  = read_csv_from_zip(SCHEDULE_ZIP, "schedule")
+    print("▶ Starting PillScan monograph refresher …")
 
-    # Keep only fields we use
-    cols = [c for c in ["DRUG_CODE","DRUG_IDENTIFICATION_NUMBER","BRAND_NAME","PRODUCT_CATEGORIZATION","CLASS"] if c in drug.columns]
-    if "DRUG_CODE" not in cols:
-        raise RuntimeError(f"drug file missing DRUG_CODE. Present: {list(drug.columns)}")
-    drug_small = drug[cols].drop_duplicates()
+    client = get_supabase_client()
 
-    # Strength string
-    if {"STRENGTH","STRENGTH_UNIT"}.issubset(ingred.columns):
-        ingred["__STR"] = (ingred["STRENGTH"].astype(str).str.strip() + " " + ingred["STRENGTH_UNIT"].astype(str).str.strip()).str.strip()
-    else:
-        ingred["__STR"] = ""
+    # 1) Read existing rows from Supabase (only fields we care about here)
+    cols_to_read = [
+        "din",
+        "monograph_url",
+        "monograph_revision_date",
+        "pm_etag",
+        "pm_last_modified",
+        "pm_last_checked_at",
+        # Optional: we pass through these on upsert if present
+        "brand_name","active_ingredient","dosage_form","modified_release",
+        "route","strength","multi_colour","coating","coated","scored",
+        "manufacturer_name","status","drug_class","schedule",
+    ]
+    existing = read_whole_table(client, TABLE_NAME, cols_to_read)
+    print(f"Loaded {len(existing):,} existing rows from Supabase.")
 
-    # Collapse 1..N to 1
-    form_c  = collapse(form,   "DRUG_CODE", "PHARMACEUTICAL_FORM", "DOSAGE_FORM")
-    route_c = collapse(route,  "DRUG_CODE", "ROUTE_OF_ADMINISTRATION", "ROUTE")
-    ingr_c  = collapse(ingred, "DRUG_CODE", "INGREDIENT", "ACTIVE_INGREDIENT")
-    str_c   = collapse(ingred, "DRUG_CODE", "__STR", "STRENGTH")
-    comp_c  = collapse(comp,   "DRUG_CODE", "COMPANY_NAME", "MANUFACTURER")
-    sched_c = collapse(sched,  "DRUG_CODE", "SCHEDULE", "SCHEDULE")
+    if existing.empty:
+        print("Nothing to process (table empty). Exiting.")
+        return
 
-    # Merge
-    df = (drug_small
-          .merge(form_c,  on="DRUG_CODE", how="left")
-          .merge(route_c, on="DRUG_CODE", how="left")
-          .merge(ingr_c,  on="DRUG_CODE", how="left")
-          .merge(str_c,   on="DRUG_CODE", how="left")
-          .merge(comp_c,  on="DRUG_CODE", how="left")
-          .merge(sched_c, on="DRUG_CODE", how="left"))
+    # 2) Build DIN -> DRUG_CODE mapping from DPD drug.zip
+    drug_df = fetch_dpd_drug_csv(DPD_DRUG_URL)
+    din_to_dc = build_din_to_drugcode(drug_df)
+    print(f"Built DIN→DRUG_CODE map with {len(din_to_dc):,} entries.")
 
-    # -----------------------------
-    # Diagnostics + forgiving filter
-    # -----------------------------
-    print("Rows before filter:", len(df))
-    try:
-        print("Top ROUTE:", df.get("ROUTE","").str.lower().value_counts().head(10).to_dict())
-    except Exception:
-        pass
-    try:
-        print("Top FORM:", df.get("DOSAGE_FORM","").str.lower().value_counts().head(10).to_dict())
-    except Exception:
-        pass
-    try:
-        print("Top CATEGORY:", df.get("PRODUCT_CATEGORIZATION","").str.lower().value_counts().head(10).to_dict())
-    except Exception:
-        pass
+    # 3) Ensure columns exist
+    for col in ["monograph_url","monograph_revision_date","pm_etag","pm_last_modified","pm_last_checked_at"]:
+        if col not in existing.columns:
+            existing[col] = None
 
-    is_human = df.get("PRODUCT_CATEGORIZATION","").str.contains(r"\bhuman\b|\bhumain\b", case=False, na=False)
-    is_oral  = df.get("ROUTE","").str.contains(r"\boral\b|\borale\b|\bby mouth\b|\bper os\b", case=False, na=False)
-    is_tabcap= df.get("DOSAGE_FORM","").str.contains(r"tablet|caplet|capsule|softgel|gélule|compr", case=False, na=False)
+    # 4) First-time discovery for rows missing monograph_url
+    need_mask = existing["monograph_url"].isna() | (existing["monograph_url"] == "")
+    to_discover = list(existing.loc[need_mask, "din"].astype(str))
+    if to_discover:
+        print(f"▶ Discovering monographs for {len(to_discover):,} DINs …")
+        # Batch async discover
+        discovered = asyncio.run(batch_discover(to_discover, din_to_dc, concurrency=10))
+        updated_indices = []
+        for din, (pdf, rev) in discovered.items():
+            idxs = existing.index[existing["din"] == din]
+            if len(idxs) == 0:
+                continue
+            i = idxs[0]
+            if pdf:
+                existing.at[i, "monograph_url"] = pdf
+            if rev:
+                existing.at[i, "monograph_revision_date"] = rev
+            existing.at[i, "pm_etag"] = None
+            existing.at[i, "pm_last_modified"] = None
+            existing.at[i, "pm_last_checked_at"] = now_utc()
+            updated_indices.append(i)
+        print(f"Discovered {len(updated_indices):,} monograph URLs.")
 
-    filtered = df[is_human & is_oral & is_tabcap].copy()
-    print("After filter:", len(filtered), "rows")
+    # 5) Cheap weekly HEAD checks for rows that already have monograph_url
+    has_url = existing["monograph_url"].notna() & (existing["monograph_url"] != "")
+    to_check = existing.loc[has_url, ["din","monograph_url","pm_etag","pm_last_modified"]].to_dict(orient="records")
 
-    if len(filtered) == 0:
-        print("⚠️ Filter removed everything. Sending 200 preview rows so we can confirm Supabase upsert works.")
-        filtered = df.head(200).copy()
+    print(f"▶ HEAD-checking {len(to_check):,} existing monograph URLs …")
+    changed = 0
+    for r in tqdm(to_check, unit="row"):
+        url = r["monograph_url"]
+        if not url:
+            continue
+        sc, hdrs = head_conditional(url, r.get("pm_etag"), r.get("pm_last_modified"))
+        i = existing.index[existing["din"] == r["din"]][0]
+        existing.at[i, "pm_last_checked_at"] = now_utc()
+        if sc == 304:
+            continue  # not modified
+        if sc == 200:
+            # Update validators; OPTIONAL: re-discover page to refresh revision_date immediately
+            existing.at[i, "pm_etag"] = hdrs.get("ETag")
+            existing.at[i, "pm_last_modified"] = hdrs.get("Last-Modified")
+            changed += 1
+        # other status codes: ignore for now (could be intermittent)
 
-    df = filtered
+    print(f"HEAD updated validators for ~{changed:,} rows.")
 
-    # DIN
-    if "DRUG_IDENTIFICATION_NUMBER" in df.columns:
-        din = df["DRUG_IDENTIFICATION_NUMBER"].astype(str).str.strip()
-        din = din.where(din != "", df["DRUG_CODE"].astype(str))
-    else:
-        din = df["DRUG_CODE"].astype(str)
-    df["din"] = din
+    # 6) Upsert back to Supabase (only columns we manage)
+    upsert_cols = [
+        "din","brand_name","active_ingredient","dosage_form","modified_release",
+        "route","strength","multi_colour","coating","coated","scored",
+        "manufacturer_name","status","drug_class","schedule",
+        "monograph_url","monograph_revision_date",
+        "pm_etag","pm_last_modified","pm_last_checked_at"
+    ]
+    present_cols = [c for c in upsert_cols if c in existing.columns]
+    rows = existing[present_cols].fillna("").to_dict(orient="records")
 
-    # Map to Supabase columns
-    df["brand_name"]        = df.get("BRAND_NAME","").astype(str).str.strip()
-    df["dosage_form"]       = df.get("DOSAGE_FORM","").astype(str).str.strip()
-    df["route"]             = df.get("ROUTE","").astype(str).str.strip()
-    df["strength"]          = df.get("STRENGTH","").astype(str).str.strip()
-    df["active_ingredient"] = df.get("ACTIVE_INGREDIENT","").astype(str).str.strip()
-    df["manufacturer"]      = df.get("MANUFACTURER","").astype(str).str.strip()
-    df["schedule"]          = df.get("SCHEDULE","").astype(str).str.strip()
-    df["class"]             = df.get("CLASS","").astype(str).str.strip()
-    df["status"]            = "Marketed"
-    df["monograph_url"]     = "https://health-products.canada.ca/dpd-bdpp/info?lang=eng&code=" + df["DRUG_CODE"].astype(str)
-
-    out = df[[
-        "din","brand_name","dosage_form","route","strength","active_ingredient",
-        "manufacturer","schedule","class","status","monograph_url"
-    ]].fillna("")
-
-    rows = out.to_dict(orient="records")
-    print(f"▶ Upserting {len(rows)} rows into Supabase.pills …")
-    if rows:
-        client.table("pills").upsert(rows, on_conflict="din").execute()
-    print("✅ Finished")
+    print(f"▶ Upserting {len(rows):,} rows into public.{TABLE_NAME} …")
+    upsert_rows(client, TABLE_NAME, rows, on_conflict="din")
+    print("✅ Done.")
 
 if __name__ == "__main__":
+    # We import asyncio here to avoid top-level dependency if someone inspects this file.
+    import asyncio
     main()
