@@ -80,6 +80,9 @@ def now_utc() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 async def batch_discover(dins: Iterable[str], din_to_drugcode: Dict[str, str], concurrency: int = 10):
+    """
+    Discover monograph PDFs for many DINs concurrently (polite limit).
+    """
     sem = asyncio.Semaphore(concurrency)
     results: Dict[str, Tuple[Optional[str], Optional[str]]] = {}
 
@@ -94,5 +97,3 @@ async def batch_discover(dins: Iterable[str], din_to_drugcode: Dict[str, str], c
     tasks = [one(d) for d in dins]
     await asyncio.gather(*tasks)
     return results
-
-
