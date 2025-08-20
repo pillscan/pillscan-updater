@@ -1,3 +1,5 @@
+from monograph import batch_discover, head_conditional, now_utc
+import asyncio
 # run_pipeline.py — Health Canada DPD (Marketed) → Supabase
 # Filters to Human • Oral • Tablet/Capsule/Softgel (with diagnostics & safe fallback)
 
