@@ -1,4 +1,4 @@
-# monograph.py
+# monograph.py  (final helper)
 from __future__ import annotations
 import re, asyncio
 from typing import Optional, Tuple, Dict, Iterable
@@ -61,29 +61,5 @@ async def discover_monograph_for_din(din: str, din_to_drugcode: Dict[str, str]) 
     async with httpx.AsyncClient(follow_redirects=True, headers={"User-Agent": UA}) as client:
         return await fetch_pm_for_drug_code(drug_code, client)
 
-def head_conditional(url: str, etag: Optional[str], last_modified: Optional[str]) -> Tuple[int, Dict[str, str]]:
-    headers = {"User-Agent": UA}
-    if etag: headers["If-None-Match"] = etag
-    if last_modified: headers["If-Modified-Since"] = last_modified
-    with httpx.Client(follow_redirects=True, timeout=12) as s:
-        r = s.head(url, headers=headers)
-    return r.status_code, dict(r.headers)
+def head_conditional(url: str, etag: Opt_
 
-def now_utc() -> str:
-    return datetime.now(timezone.utc).isoformat()
-
-async def batch_discover(dins: Iterable[str], din_to_drugcode: Dict[str, str], concurrency: int = 10):
-    sem = asyncio.Semaphore(concurrency)
-    results: Dict[str, Tuple[Optional[str], Optional[str]]] = {}
-
-    async def one(d: str):
-        async with sem:
-            try:
-                pdf, rev = await discover_monograph_for_din(d, din_to_drugcode)
-                results[d] = (pdf, rev)
-            except Exception:
-                results[d] = (None, None)
-
-    tasks = [one(d) for d in dins]
-    await asyncio.gather(*tasks)
-    return results
